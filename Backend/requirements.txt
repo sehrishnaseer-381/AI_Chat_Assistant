@@ -1,0 +1,8 @@
+fastapi==0.115.13
+uvicorn[standard]==0.34.3
+pydantic-settings==2.13.1
+pytest==8.4.2
+httpx==0.28.1
+groq
+PyJWT[crypto]
+pwdlib[argon2]
