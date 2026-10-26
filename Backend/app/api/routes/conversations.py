@@ -3,9 +3,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import Conversation, User
 from app.schemas.conversation import ConversationCreate, ConversationRead
+
 
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
@@ -18,17 +20,10 @@ router = APIRouter(prefix="/conversations", tags=["Conversations"])
 def create_conversation(
     payload: ConversationCreate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    user = db.get(User, payload.user_id)
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found.",
-        )
-
     conversation = Conversation(
-        user_id=payload.user_id,
+        user_id=current_user.id,
         title=payload.title,
     )
 
@@ -43,8 +38,14 @@ def create_conversation(
 def get_conversation(
     conversation_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    conversation = db.get(Conversation, conversation_id)
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user.id,
+        )
+    )
 
     if conversation is None:
         raise HTTPException(
@@ -59,18 +60,17 @@ def get_conversation(
 def list_user_conversations(
     user_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    user = db.get(User, user_id)
-
-    if user is None:
+    if user_id != current_user.id:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot access another user's conversations.",
         )
 
     statement = (
         select(Conversation)
-        .where(Conversation.user_id == user_id)
+        .where(Conversation.user_id == current_user.id)
         .order_by(Conversation.created_at.desc())
     )
 

@@ -1,27 +1,16 @@
 
-from groq import Groq
-
-from app.core.config import get_settings
+from app.services.graph_service import generate_graph_reply
 
 
-def generate_reply(messages: list[dict[str, str]]) -> str:
-    settings = get_settings()
+async def generate_reply(
+    messages: list[dict[str, str]],
+    graph,
+    conversation_id: int,
+) -> str:
+    from app.services.graph_service import generate_graph_reply
 
-    if not settings.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
-
-    client = Groq(api_key=settings.groq_api_key)
-
-    completion = client.chat.completions.create(
-        model=settings.groq_model,
+    return await generate_graph_reply(
         messages=messages,
-        temperature=0.7,
-        max_completion_tokens=1024,
+        graph=graph,
+        conversation_id=conversation_id,
     )
-
-    reply = completion.choices[0].message.content
-
-    if not reply:
-        raise RuntimeError("The AI model returned an empty response.")
-
-    return reply

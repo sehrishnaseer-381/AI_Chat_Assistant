@@ -1,12 +1,13 @@
 
 import logging
-
+from fastapi import Request
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.db.session import get_db
-from app.models import Conversation, Message
+from app.models import Conversation, Message, User
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.ai_service import generate_reply
 
@@ -19,12 +20,20 @@ router = APIRouter(tags=["Chat"])
     "/conversations/{conversation_id}/chat",
     response_model=ChatResponse,
 )
-def chat_with_ai(
+async def chat_with_ai(
     conversation_id: int,
     payload: ChatRequest,
+    request: Request,
     db: Session = Depends(get_db),
-):
-    conversation = db.get(Conversation, conversation_id)
+    current_user: User = Depends(get_current_user),
+    ):
+    # Verify that this conversation belongs to the logged-in user.
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user.id,
+        )
+    )
 
     if conversation is None:
         raise HTTPException(
@@ -32,7 +41,7 @@ def chat_with_ai(
             detail="Conversation not found.",
         )
 
-    # Save the user's message first.
+    # Save the user's message.
     user_message = Message(
         conversation_id=conversation_id,
         role="user",
@@ -42,7 +51,7 @@ def chat_with_ai(
     db.commit()
     db.refresh(user_message)
 
-    # Load the conversation history in chronological order.
+    # Load conversation history chronologically.
     statement = (
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -65,17 +74,19 @@ def chat_with_ai(
         for message in history
     )
 
-    # Ask Groq to generate the assistant's response.
+    # Ask Groq to generate the response.
     try:
-        reply = generate_reply(messages)
+       reply = await generate_reply(
+    messages=messages,
+    graph=request.app.state.graph,
+    conversation_id=conversation_id,
+    )
     except Exception as exc:
         logger.exception("AI response generation failed")
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Could not generate an AI response. "
-                "Check the backend configuration and logs."
-            ),
+            detail="Could not generate an AI response. "
+                   "Check the backend configuration and logs.",
         ) from exc
 
     # Save the assistant's response.

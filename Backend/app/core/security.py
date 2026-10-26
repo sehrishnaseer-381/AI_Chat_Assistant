@@ -1,5 +1,10 @@
 
 from pwdlib import PasswordHash
+from datetime import datetime, timedelta, timezone
+
+import jwt
+
+from app.core.config import get_settings
 
 password_hasher = PasswordHash.recommended()
 
@@ -17,4 +22,25 @@ def verify_password(
     return password_hasher.verify(
         plain_password,
         hashed_password,
+    )
+
+
+def create_access_token(user_id: int) -> str:
+    settings = get_settings()
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(
+        minutes=settings.jwt_access_token_expire_minutes
+    )
+
+    payload = {
+        "sub": str(user_id),
+        "iat": now,
+        "exp": expires_at,
+    }
+
+    return jwt.encode(
+        payload,
+        settings.jwt_secret_key,
+        algorithm="HS256",
     )
