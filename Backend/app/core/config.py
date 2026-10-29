@@ -1,4 +1,4 @@
-
+﻿
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,6 +22,10 @@ class Settings(BaseSettings):
 
     jwt_secret_key: str
     jwt_access_token_expire_minutes: int = 30
+
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_redirect_uri: str = "http://localhost:8000/api/v1/auth/google/callback"
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

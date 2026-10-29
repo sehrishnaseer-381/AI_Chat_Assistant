@@ -16,3 +16,8 @@ class ConversationRead(BaseModel):
     user_id: int
     title: str
     created_at: datetime
+
+
+
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)

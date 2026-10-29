@@ -15,3 +15,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+class GoogleTicketExchangeRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=256)

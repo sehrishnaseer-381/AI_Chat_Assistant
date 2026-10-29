@@ -2,6 +2,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.chat import router as chat_router
@@ -12,6 +13,9 @@ from app.core.config import get_settings
 from app.services.checkpoint_service import checkpoint_lifespan
 from app.services.graph_service import build_graph
 from app.services.mcp_service import load_mcp_tools
+from starlette.middleware.sessions import SessionMiddleware
+
+
 
 settings = get_settings()
 
@@ -49,6 +53,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.jwt_secret_key,
+    same_site="lax",
+    https_only=False,  # Local HTTP development only
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app.include_router(users_router, prefix=settings.api_prefix)
 app.include_router(conversations_router, prefix=settings.api_prefix)

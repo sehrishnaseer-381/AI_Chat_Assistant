@@ -1,4 +1,4 @@
-
+﻿
 from datetime import datetime
 
 from sqlalchemy import DateTime, String, func
@@ -35,6 +35,12 @@ class User(Base):
 
     conversations = relationship(
         "Conversation",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    identities = relationship(
+        "UserIdentity",
         back_populates="user",
         cascade="all, delete-orphan",
     )

@@ -1,4 +1,4 @@
-
+﻿
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -57,27 +57,40 @@ def build_graph(checkpointer=None, tools=None):
         api_key=settings.groq_api_key,
         model=settings.groq_model,
         temperature=0.7,
-        max_tokens=1024,
+        max_tokens=4096,
     )
 
     model_with_tools = model.bind_tools(tools) if tools else model
+
 
     async def call_model(state: AssistantState) -> dict:
         messages = state["messages"]
 
         response = await model_with_tools.ainvoke(
-    [SystemMessage(content=SYSTEM_PROMPT), *messages])
+            [SystemMessage(content=SYSTEM_PROMPT), *messages]
+        )
+
         logger.info(
-    "Model response: tool_calls=%s",
-    [
-        {
-            "name": tool_call.get("name"),
-            "id": tool_call.get("id"),
-        }
-        for tool_call in getattr(response, "tool_calls", [])
-    ],
-)
+            "Model finish reason: %s",
+            response.response_metadata.get("finish_reason"),
+        )
+        logger.info(
+            "Model usage: %s",
+            response.usage_metadata,
+        )
+        logger.info(
+            "Model response: tool_calls=%s",
+            [
+                {
+                    "name": tool_call.get("name"),
+                    "id": tool_call.get("id"),
+                }
+                for tool_call in getattr(response, "tool_calls", [])
+            ],
+        )
+
         return {"messages": [response]}
+
 
     builder = StateGraph(AssistantState)
     builder.add_node("assistant", call_model)

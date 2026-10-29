@@ -7,7 +7,12 @@ from alembic import context
 
 from app.core.config import get_settings
 from app.db.session import Base
-from app.models import User  # noqa: F401
+from app.models import User, UserIdentity  # noqa: F401
+from app.models import (
+    User,
+    UserIdentity,
+    GoogleLoginTicket,
+)  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -22,6 +27,7 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # Tell Alembic which SQLAlchemy models to inspect.
+
 target_metadata = Base.metadata
 
 # Load the database URL from the root .env file.
