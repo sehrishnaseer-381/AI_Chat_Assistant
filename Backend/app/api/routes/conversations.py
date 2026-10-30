@@ -1,11 +1,11 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
-from app.models import Conversation, User
+from app.models import Conversation, Message, User
 from app.schemas.conversation import (
     ConversationCreate,
     ConversationRead,
@@ -35,6 +35,36 @@ def create_conversation(
     db.refresh(conversation)
 
     return conversation
+
+@router.get("/search", response_model=list[ConversationRead])
+def search_conversations(
+    q: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query = q.strip()
+
+    if not query:
+        return []
+
+    search_pattern = f"%{query}%"
+
+    statement = (
+        select(Conversation)
+        .where(
+            Conversation.user_id == current_user.id,
+            or_(
+                Conversation.title.ilike(search_pattern),
+                Conversation.messages.any(
+                    Message.content.ilike(search_pattern)
+                ),
+            ),
+        )
+        .order_by(Conversation.created_at.desc())
+        .limit(50)
+    )
+
+    return list(db.scalars(statement).all())
 
 
 @router.get("/{conversation_id}", response_model=ConversationRead)

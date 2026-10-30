@@ -381,6 +381,10 @@ button:disabled {
   scroll-behavior: smooth;
 }
 
+.messages-area.streaming-active {
+  scroll-behavior: auto;
+}
+
 .message-status {
   padding: 24px 0;
   color: #899189;
@@ -472,6 +476,116 @@ button:disabled {
   font-size: 13.5px;
   line-height: 1.75;
   overflow-wrap: anywhere;
+}
+
+.message-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.message-action-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  color: #245d43;
+  background: #edf3ec;
+  border: 1px solid #dfe8df;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.message-action-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.regeneration-error {
+  margin: 8px 0 0;
+  color: #9a3838;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.copy-message-error {
+  margin: 8px 0 0;
+  color: #9a3838;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.regenerating-icon {
+  animation: regenerate-spin 1s linear infinite;
+}
+
+@keyframes regenerate-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.edit-message-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(100%, 520px);
+}
+
+.edit-message-box textarea {
+  width: 100%;
+  min-height: 90px;
+  padding: 10px 12px;
+  color: #1e2a23;
+  background: #fff;
+  border: 1px solid #d9e1d8;
+  border-radius: 10px;
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.edit-message-box textarea:focus {
+  outline: 2px solid rgb(36 93 67 / 10%);
+  border-color: #7a9b83;
+}
+
+.edit-message-error {
+  margin: 0;
+  color: #9a3838;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.edit-message-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.save-edit-button,
+.cancel-edit-button {
+  padding: 7px 12px;
+  border-radius: 9px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.save-edit-button {
+  color: #fff;
+  background: #245d43;
+  border: 1px solid #245d43;
+}
+
+.cancel-edit-button {
+  color: #245d43;
+  background: #edf3ec;
+  border: 1px solid #dfe8df;
 }
 
 .message-content > :first-child {
@@ -1287,4 +1401,44 @@ button:disabled {
     font-size: 14px;
     line-height: 1.75;
   }
+}
+
+
+
+
+.conversation-search {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  color: var(--text-color, #202923);
+  background: var(--surface-color, #fff);
+  border: 1px solid var(--border-color, #d1d5db);
+  border-radius: 9px;
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.conversation-search::placeholder {
+  color: var(--muted-color, #899189);
+}
+
+.conversation-search:focus {
+  border-color: #7a9b83;
+  box-shadow: 0 0 0 3px rgb(36 93 67 / 10%);
+}
+
+.conversation-search::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+.search-status {
+  color: var(--muted-color, #899189);
+}
+
+.search-error {
+  margin: 0 4px;
 }

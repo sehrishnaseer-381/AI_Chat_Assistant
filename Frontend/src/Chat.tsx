@@ -22,16 +22,22 @@ import {
   Check,
   X,
   Trash2,
+  RotateCcw,
+  Copy,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
   createConversation,
   getUserConversations,
+  searchConversations,
   getConversationMessages,
-  sendChatMessage,
   renameConversation,
   deleteConversation,
+  editMessage,
+  regenerateAssistantMessage,
+  streamChatMessage,
+  retryChatMessageStream,
   type Conversation,
   type ChatMessage,
 } from './api'
@@ -52,6 +58,11 @@ export default function Chat() {
   const [historyError, setHistoryError] = useState('')
   const [chatError, setChatError] = useState('')
 
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<Conversation[]>([])
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+
   const [openConversationMenuId, setOpenConversationMenuId] =
   useState<number | null>(null)
 
@@ -65,10 +76,31 @@ export default function Chat() {
   const [failedMessage, setFailedMessage] = useState<{
   conversationId: number
   content: string
+  messageId?: number
 } | null>(null)
+  const [editingMessageId, setEditingMessageId] = useState<number | null>(null)
+  const [editedPrompt, setEditedPrompt] = useState('')
+  const [editingMessageError, setEditingMessageError] = useState('')
+  const [savingEditedMessage, setSavingEditedMessage] = useState(false)
+  const [regeneratingMessageId, setRegeneratingMessageId] =
+    useState<number | null>(null)
+  const [regenerationError, setRegenerationError] = useState<{
+    messageId: number
+    content: string
+  } | null>(null)
+  const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null)
+  const [copyErrorMessageId, setCopyErrorMessageId] = useState<number | null>(
+    null,
+  )
+  const [streamedResponse, setStreamedResponse] = useState('')
 
   const bottomRef = useRef<HTMLDivElement>(null)
+  const messagesAreaRef = useRef<HTMLElement>(null)
+  const shouldFollowStreamRef = useRef(true)
   const requestVersionRef = useRef(0)
+  const searchRequestVersionRef = useRef(0)
+  const copyFeedbackTimeoutRef = useRef<number | null>(null)
+  const activeChatAbortRef = useRef<AbortController | null>(null)
 
   const userId = Number(sessionStorage.getItem('user_id'))
   const userEmail = sessionStorage.getItem('user_email') || 'User'
@@ -100,13 +132,84 @@ export default function Chat() {
   }, [loadConversations])
 
   useEffect(() => {
+    const messagesArea = messagesAreaRef.current
+    if (!messagesArea) return
+
+    if (sending) {
+      if (!shouldFollowStreamRef.current) return
+
+      const frame = window.requestAnimationFrame(() => {
+        messagesArea.scrollTop = messagesArea.scrollHeight
+      })
+      return () => window.cancelAnimationFrame(frame)
+    }
+
     bottomRef.current?.scrollIntoView({
       behavior: 'smooth',
       block: 'end',
     })
-  }, [messages, sending])
+  }, [messages, sending, streamedResponse])
+
+  useEffect(
+    () => () => {
+      if (copyFeedbackTimeoutRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current)
+      }
+      activeChatAbortRef.current?.abort()
+    },
+    [],
+  )
+
+  useEffect(() => {
+    const query = searchQuery.trim()
+
+    if (!query) return
+
+    const requestVersion = searchRequestVersionRef.current
+    let cancelled = false
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const results = await searchConversations(query)
+
+        if (
+          !cancelled &&
+          requestVersion === searchRequestVersionRef.current
+        ) {
+          setSearchResults(results)
+        }
+      } catch (error) {
+        if (
+          !cancelled &&
+          requestVersion === searchRequestVersionRef.current
+        ) {
+          setSearchError(
+            'Could not search conversations. Please try again.',
+          )
+          setSearchResults([])
+        }
+
+        console.error('Failed to search conversations:', error)
+      } finally {
+        if (
+          !cancelled &&
+          requestVersion === searchRequestVersionRef.current
+        ) {
+          setSearching(false)
+        }
+      }
+    }, 300)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [searchQuery])
 
   const selectConversation = async (conversationId: number) => {
+    activeChatAbortRef.current?.abort()
+    setStreamedResponse('')
+    shouldFollowStreamRef.current = true
     const requestVersion = ++requestVersionRef.current
 
     setActiveConversationId(conversationId)
@@ -146,6 +249,9 @@ export default function Chat() {
     setCreatingChat(true)
     setHistoryError('')
     setChatError('')
+    activeChatAbortRef.current?.abort()
+    setStreamedResponse('')
+    shouldFollowStreamRef.current = true
 
     try {
       const conversation = await createConversation(userId, 'New chat')
@@ -178,17 +284,53 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
   const content = message.trim()
   const conversationId = activeConversationId
 
-  if (!content || !conversationId || sending || loadingMessages) return
+  if (
+    !content ||
+    !conversationId ||
+    sending ||
+    loadingMessages ||
+    regeneratingMessageId !== null
+  ) return
 
   const requestVersion = requestVersionRef.current
+  const controller = new AbortController()
+  let persistedUserMessageId: number | undefined
 
+  shouldFollowStreamRef.current = true
   setSending(true)
   setChatError('')
   setMessage('')
+  setStreamedResponse('')
   setFailedMessage({ conversationId, content })
+  activeChatAbortRef.current = controller
 
   try {
-    const response = await sendChatMessage(conversationId, content)
+    const response = await streamChatMessage(
+      conversationId,
+      content,
+      (userMessage) => {
+        persistedUserMessageId = userMessage.id
+        if (
+          activeConversationId !== conversationId ||
+          requestVersionRef.current !== requestVersion
+        ) {
+          return
+        }
+        setMessages((previous) => [
+          ...previous.filter((item) => item.id !== userMessage.id),
+          userMessage,
+        ])
+      },
+      (chunk) => {
+        if (
+          activeConversationId === conversationId &&
+          requestVersionRef.current === requestVersion
+        ) {
+          setStreamedResponse((previous) => previous + chunk)
+        }
+      },
+      controller.signal,
+    )
 
     // Ignore results if the conversation changed or was deleted.
     if (
@@ -207,23 +349,122 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
       response.user_message,
       response.assistant_message,
     ])
+    setStreamedResponse('')
+    setFailedMessage(null)
 
     // Refresh conversation titles and ordering.
     void loadConversations()
   } catch (error) {
     if (
       activeConversationId === conversationId &&
-      requestVersionRef.current === requestVersion
+      requestVersionRef.current === requestVersion &&
+      !controller.signal.aborted
     ) {
       setChatError('Your message could not be sent. Please try again.')
-
-      // Restore the failed message only if the input is still empty.
-      setMessage((current) => current || content)
+      setStreamedResponse('')
+      if (persistedUserMessageId !== undefined) {
+        setFailedMessage({
+          conversationId,
+          content,
+          messageId: persistedUserMessageId,
+        })
+      } else {
+        setMessage((current) => current || content)
+      }
     }
 
     console.error('Failed to send chat message:', error)
   } finally {
-    setSending(false)
+    if (activeChatAbortRef.current === controller) {
+      activeChatAbortRef.current = null
+      setSending(false)
+    }
+  }
+}
+
+const handleRetryFailedMessage = async () => {
+  const failed = failedMessage
+  if (
+    !failed ||
+    failed.messageId === undefined ||
+    failed.conversationId !== activeConversationId ||
+    sending ||
+    loadingMessages
+  ) {
+    if (failed && failed.messageId === undefined) {
+      setMessage((current) => current || failed.content)
+      setChatError('')
+    }
+    return
+  }
+
+  const requestVersion = requestVersionRef.current
+  const controller = new AbortController()
+  shouldFollowStreamRef.current = true
+  setSending(true)
+  setChatError('')
+  setStreamedResponse('')
+  activeChatAbortRef.current = controller
+
+  try {
+    const response = await retryChatMessageStream(
+      failed.conversationId,
+      failed.messageId,
+      (userMessage) => {
+        if (
+          activeConversationId === failed.conversationId &&
+          requestVersionRef.current === requestVersion
+        ) {
+          setMessages((previous) => [
+            ...previous.filter((item) => item.id !== userMessage.id),
+            userMessage,
+          ])
+        }
+      },
+      (chunk) => {
+        if (
+          activeConversationId === failed.conversationId &&
+          requestVersionRef.current === requestVersion
+        ) {
+          setStreamedResponse((previous) => previous + chunk)
+        }
+      },
+      controller.signal,
+    )
+
+    if (
+      activeConversationId !== failed.conversationId ||
+      requestVersionRef.current !== requestVersion
+    ) {
+      return
+    }
+
+    setMessages((previous) => [
+      ...previous.filter(
+        (item) =>
+          item.id !== response.user_message.id &&
+          item.id !== response.assistant_message.id,
+      ),
+      response.user_message,
+      response.assistant_message,
+    ])
+    setStreamedResponse('')
+    setFailedMessage(null)
+  } catch (error) {
+    if (
+      activeConversationId === failed.conversationId &&
+      requestVersionRef.current === requestVersion &&
+      !controller.signal.aborted
+    ) {
+      setStreamedResponse('')
+      setChatError('The response could not be completed. Please retry.')
+    }
+    console.error('Failed to retry chat response:', error)
+  } finally {
+    if (activeChatAbortRef.current === controller) {
+      activeChatAbortRef.current = null
+      setSending(false)
+    }
   }
 }
 
@@ -237,6 +478,180 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
     ) {
       event.preventDefault()
       void handleSend()
+    }
+  }
+
+  const handleSaveEditedPrompt = async () => {
+    if (
+      editingMessageId === null ||
+      activeConversationId === null ||
+      savingEditedMessage ||
+      regeneratingMessageId !== null
+    ) {
+      return
+    }
+
+    const conversationId = activeConversationId
+    const requestVersion = requestVersionRef.current
+    const nextValue = editedPrompt.trim()
+    if (!nextValue) {
+      setEditingMessageError('Please enter a message before saving.')
+      return
+    }
+
+    setSavingEditedMessage(true)
+    setEditingMessageError('')
+
+    try {
+      const response = await editMessage(
+        conversationId,
+        editingMessageId,
+        nextValue,
+      )
+
+      if (
+        activeConversationId !== conversationId ||
+        requestVersionRef.current !== requestVersion
+      ) {
+        return
+      }
+
+      setMessages((previous) => {
+        const editedMessageIndex = previous.findIndex(
+          (item) => item.id === response.user_message.id,
+        )
+
+        if (editedMessageIndex === -1) return previous
+
+        return [
+          ...previous.slice(0, editedMessageIndex),
+          response.user_message,
+          response.assistant_message,
+        ]
+      })
+
+      const updatedConversation = conversations.find(
+        (item) => item.id === conversationId,
+      )
+      if (updatedConversation && updatedConversation.title === 'New chat') {
+        setConversations((previous) =>
+          previous.map((conversation) =>
+            conversation.id === conversationId
+              ? { ...conversation, title: response.user_message.content.trim() || conversation.title }
+              : conversation,
+          ),
+        )
+      }
+
+      setEditingMessageId(null)
+      setEditedPrompt('')
+      setEditingMessageError('')
+      void loadConversations()
+    } catch (error) {
+      console.error('Failed to edit previous prompt:', error)
+      setEditingMessageError(
+        'Could not update this message. Please check your input and try again.',
+      )
+    } finally {
+      setSavingEditedMessage(false)
+    }
+  }
+
+  const handleRegenerateAnswer = async (assistantMessageId: number) => {
+    const conversationId = activeConversationId
+    if (
+      conversationId === null ||
+      regeneratingMessageId !== null ||
+      sending ||
+      savingEditedMessage ||
+      loadingMessages
+    ) {
+      return
+    }
+
+    const requestVersion = requestVersionRef.current
+    setRegeneratingMessageId(assistantMessageId)
+    setRegenerationError(null)
+
+    try {
+      const updatedMessage = await regenerateAssistantMessage(
+        conversationId,
+        assistantMessageId,
+      )
+
+      if (
+        activeConversationId !== conversationId ||
+        requestVersionRef.current !== requestVersion
+      ) {
+        return
+      }
+
+      setMessages((previous) =>
+        previous.map((item) =>
+          item.id === assistantMessageId ? updatedMessage : item,
+        ),
+      )
+    } catch (error) {
+      console.error('Failed to regenerate assistant response:', error)
+      if (
+        activeConversationId === conversationId &&
+        requestVersionRef.current === requestVersion
+      ) {
+        setRegenerationError({
+          messageId: assistantMessageId,
+          content: 'Could not regenerate this answer. Please try again.',
+        })
+      }
+    } finally {
+      setRegeneratingMessageId(null)
+    }
+  }
+
+  const handleCopyMessage = async (messageId: number, content: string) => {
+    const copyWithLegacyApi = () => {
+      const textArea = document.createElement('textarea')
+      textArea.value = content
+      textArea.setAttribute('readonly', '')
+      textArea.style.position = 'fixed'
+      textArea.style.opacity = '0'
+      document.body.appendChild(textArea)
+      textArea.select()
+
+      try {
+        if (!document.execCommand('copy')) {
+          throw new Error('The browser rejected the copy command.')
+        }
+      } finally {
+        document.body.removeChild(textArea)
+      }
+    }
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(content)
+        } catch {
+          copyWithLegacyApi()
+        }
+      } else {
+        copyWithLegacyApi()
+      }
+
+      setCopyErrorMessageId(null)
+      setCopiedMessageId(messageId)
+      if (copyFeedbackTimeoutRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current)
+      }
+      copyFeedbackTimeoutRef.current = window.setTimeout(() => {
+        setCopiedMessageId((current) =>
+          current === messageId ? null : current,
+        )
+        copyFeedbackTimeoutRef.current = null
+      }, 1800)
+    } catch (error) {
+      console.error('Failed to copy assistant message:', error)
+      setCopiedMessageId(null)
+      setCopyErrorMessageId(messageId)
     }
   }
 
@@ -254,6 +669,13 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
       )
 
       setConversations((previous) =>
+        previous.map((conversation) =>
+          conversation.id === conversationId
+            ? { ...conversation, title: updatedConversation.title }
+            : conversation,
+        ),
+      )
+      setSearchResults((previous) =>
         previous.map((conversation) =>
           conversation.id === conversationId
             ? { ...conversation, title: updatedConversation.title }
@@ -289,6 +711,10 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
       setIsDeleting(true)
 
       try {
+        if (activeConversationId === conversationId) {
+          activeChatAbortRef.current?.abort()
+          setStreamedResponse('')
+        }
         await deleteConversation(conversationId)
 
         const remainingConversations = conversations.filter(
@@ -296,6 +722,9 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
         )
 
         setConversations(remainingConversations)
+        setSearchResults((previous) =>
+          previous.filter((item) => item.id !== conversationId),
+        )
 
         if (renamingConversationId === conversationId) {
           setRenamingConversationId(null)
@@ -327,11 +756,15 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
 
 
   const handleLogout = () => {
+    activeChatAbortRef.current?.abort()
     sessionStorage.removeItem('access_token')
     sessionStorage.removeItem('user_id')
     sessionStorage.removeItem('user_email')
     window.location.reload()
   }
+
+  const searchActive = Boolean(searchQuery.trim())
+  const visibleConversations = searchActive ? searchResults : conversations
 
 return (
   <div className={`chat-layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
@@ -367,13 +800,29 @@ return (
       <div className="history-section">
         <div className="history-label">YOUR CHATS</div>
 
-        {loadingHistory && (
+        <input
+          className="conversation-search"
+          type="search"
+          placeholder="Search conversations..."
+          aria-label="Search conversations"
+          value={searchQuery}
+          onChange={(event) => {
+            const query = event.target.value
+            searchRequestVersionRef.current += 1
+            setSearchQuery(query)
+            setSearchResults([])
+            setSearching(Boolean(query.trim()))
+            setSearchError('')
+          }}
+        />
+
+        {!searchActive && loadingHistory && (
           <div className="sidebar-message">
             Loading conversations...
           </div>
         )}
 
-        {historyError && (
+        {!searchActive && historyError && (
           <div className="sidebar-error">
             <p>{historyError}</p>
             <button onClick={() => void loadConversations()}>
@@ -382,7 +831,8 @@ return (
           </div>
         )}
 
-        {!loadingHistory &&
+        {!searchActive &&
+          !loadingHistory &&
           !historyError &&
           conversations.length === 0 && (
             <div className="sidebar-message">
@@ -390,7 +840,28 @@ return (
             </div>
           )}
 
-        {conversations.map((conversation) => (
+        {searchActive && searching && (
+          <div className="sidebar-message search-status" role="status">
+            Searching conversations...
+          </div>
+        )}
+
+        {searchActive && searchError && (
+          <div className="sidebar-error search-error" role="alert">
+            <p>{searchError}</p>
+          </div>
+        )}
+
+        {searchActive &&
+          !searching &&
+          !searchError &&
+          searchResults.length === 0 && (
+            <div className="sidebar-message" role="status">
+              No matching conversations found.
+            </div>
+          )}
+
+        {visibleConversations.map((conversation) => (
           <div
             key={conversation.id}
             className={`history-item-wrapper ${
@@ -575,7 +1046,12 @@ return (
             <button
               className="icon-button"
               onClick={() => void selectConversation(activeConversationId)}
-              disabled={loadingMessages || sending}
+              disabled={
+              loadingMessages ||
+              sending ||
+              savingEditedMessage ||
+              regeneratingMessageId !== null
+              }
               title="Reload messages"
               aria-label="Reload messages"
             >
@@ -583,7 +1059,17 @@ return (
             </button>
           </header>
 
-          <section className="messages-area" aria-live="polite">
+          <section
+            ref={messagesAreaRef}
+            className={`messages-area ${sending ? 'streaming-active' : ''}`}
+            aria-live="polite"
+            onScroll={(event) => {
+              const element = event.currentTarget
+              const distanceFromBottom =
+                element.scrollHeight - element.scrollTop - element.clientHeight
+              shouldFollowStreamRef.current = distanceFromBottom < 64
+            }}
+          >
             {loadingMessages && (
               <div className="message-status">
                 Loading messages...
@@ -614,22 +1100,152 @@ return (
                 )}
 
                 <div className={`message-bubble ${item.role}-bubble`}>
-                  <div className="message-content">
-                    {item.role === 'assistant' ? (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {item.content}
-                      </ReactMarkdown>
-                    ) : (
-                      <p>{item.content}</p>
-                    )}
-                  </div>
+                  {item.role === 'user' && editingMessageId === item.id ? (
+                    <div className="edit-message-box">
+                      <textarea
+                        value={editedPrompt}
+                        onChange={(event) => setEditedPrompt(event.target.value)}
+                        rows={4}
+                        aria-label="Edit prompt"
+                        disabled={savingEditedMessage}
+                      />
 
-                  <time className="message-time">
-                    {new Date(item.created_at).toLocaleTimeString([], {
-                      hour: 'numeric',
-                      minute: '2-digit',
-                    })}
-                  </time>
+                      {editingMessageError && (
+                        <p className="edit-message-error">{editingMessageError}</p>
+                      )}
+
+                      <div className="edit-message-actions">
+                        <button
+                          type="button"
+                          className="save-edit-button"
+                          onClick={() => void handleSaveEditedPrompt()}
+                          disabled={savingEditedMessage || !editedPrompt.trim()}
+                        >
+                          {savingEditedMessage ? 'Saving...' : 'Save'}
+                        </button>
+                        <button
+                          type="button"
+                          className="cancel-edit-button"
+                          onClick={() => {
+                            setEditingMessageId(null)
+                            setEditedPrompt('')
+                            setEditingMessageError('')
+                          }}
+                          disabled={savingEditedMessage}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="message-content">
+                        {item.role === 'assistant' ? (
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {item.content}
+                          </ReactMarkdown>
+                        ) : (
+                          <p>{item.content}</p>
+                        )}
+                      </div>
+
+                      {item.role === 'user' && (
+                        <div className="message-actions">
+                          <button
+                            type="button"
+                            className="message-action-button"
+                            disabled={
+                              sending ||
+                              loadingMessages ||
+                              savingEditedMessage ||
+                              regeneratingMessageId !== null
+                            }
+                            onClick={() => {
+                              setEditingMessageId(item.id)
+                              setEditedPrompt(item.content)
+                              setEditingMessageError('')
+                            }}
+                            aria-label="Edit message"
+                          >
+                            <Pencil size={14} />
+                            Edit
+                          </button>
+                        </div>
+                      )}
+
+                      {item.role === 'assistant' && (
+                        <>
+                          {regenerationError?.messageId === item.id && (
+                            <p className="regeneration-error" role="alert">
+                              {regenerationError.content}
+                            </p>
+                          )}
+                          {copyErrorMessageId === item.id && (
+                            <p className="copy-message-error" role="alert">
+                              Could not copy this answer. Try selecting and
+                              copying the text.
+                            </p>
+                          )}
+                          <div className="message-actions">
+                            <button
+                              type="button"
+                              className="message-action-button"
+                              onClick={() =>
+                                void handleCopyMessage(item.id, item.content)
+                              }
+                              aria-label={
+                                copiedMessageId === item.id
+                                  ? 'Message copied'
+                                  : 'Copy message'
+                              }
+                            >
+                              {copiedMessageId === item.id ? (
+                                <Check size={14} />
+                              ) : (
+                                <Copy size={14} />
+                              )}
+                              {copiedMessageId === item.id
+                                ? 'Copied!'
+                                : 'Copy'}
+                            </button>
+                            <button
+                              type="button"
+                              className="message-action-button"
+                              onClick={() =>
+                                void handleRegenerateAnswer(item.id)
+                              }
+                              disabled={
+                                sending ||
+                                loadingMessages ||
+                                savingEditedMessage ||
+                                regeneratingMessageId !== null
+                              }
+                              aria-label="Regenerate answer"
+                            >
+                              <RotateCcw
+                                size={14}
+                                className={
+                                  regeneratingMessageId === item.id
+                                    ? 'regenerating-icon'
+                                    : undefined
+                                }
+                              />
+                              {regeneratingMessageId === item.id
+                                ? 'Regenerating...'
+                                : 'Regenerate'}
+                            </button>
+                          </div>
+                        </>
+                      )}
+
+                      <time className="message-time">
+                        {new Date(item.created_at).toLocaleTimeString([], {
+                          hour: 'numeric',
+                          minute: '2-digit',
+                        })}
+                      </time>
+                    </>
+                  )}
                 </div>
               </article>
             ))}
@@ -640,10 +1256,20 @@ return (
                   <Bot size={17} />
                 </div>
 
-                <div className="message-bubble assistant-bubble typing-bubble">
-                  <span className="typing-dot" />
-                  <span className="typing-dot" />
-                  <span className="typing-dot" />
+                <div className="message-bubble assistant-bubble">
+                  {streamedResponse ? (
+                    <div className="message-content streaming-message">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {streamedResponse}
+                      </ReactMarkdown>
+                    </div>
+                  ) : (
+                    <div className="typing-bubble" role="status">
+                      <span className="typing-dot" />
+                      <span className="typing-dot" />
+                      <span className="typing-dot" />
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -657,12 +1283,11 @@ return (
       <button
         type="button"
         disabled={sending || loadingMessages}
-        onClick={() => {
-          setMessage(failedMessage.content)
-          setChatError('')
-        }}
+        onClick={() => void handleRetryFailedMessage()}
       >
-        Retry message
+        {failedMessage.messageId !== undefined
+          ? 'Retry response'
+          : 'Retry message'}
       </button>
     )}
 
@@ -693,13 +1318,17 @@ return (
                 placeholder="Message AI Assistant..."
                 rows={1}
                 aria-label="Message"
-                disabled={sending || loadingMessages}
               />
 
               <button
                 type="submit"
                 className="send-button"
-                disabled={!message.trim() || sending || loadingMessages}
+                disabled={
+                  !message.trim() ||
+                  sending ||
+                  loadingMessages ||
+                  regeneratingMessageId !== null
+                }
                 aria-label="Send message"
                 title="Send message"
               >
