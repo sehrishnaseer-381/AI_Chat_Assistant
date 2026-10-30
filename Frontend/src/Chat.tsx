@@ -1186,10 +1186,10 @@ return (
                               copying the text.
                             </p>
                           )}
-                          <div className="message-actions">
+                          <div className="message-actions assistant-message-actions">
                             <button
                               type="button"
-                              className="message-action-button"
+                              className={`message-action-button${copiedMessageId === item.id ? ' is-copied' : ''}`}
                               onClick={() =>
                                 void handleCopyMessage(item.id, item.content)
                               }
@@ -1210,7 +1210,7 @@ return (
                             </button>
                             <button
                               type="button"
-                              className="message-action-button"
+                              className={`message-action-button${regeneratingMessageId === item.id ? ' is-regenerating' : ''}`}
                               onClick={() =>
                                 void handleRegenerateAnswer(item.id)
                               }
@@ -1220,7 +1220,11 @@ return (
                                 savingEditedMessage ||
                                 regeneratingMessageId !== null
                               }
-                              aria-label="Regenerate answer"
+                              aria-label={
+                                regeneratingMessageId === item.id
+                                  ? 'Regenerating answer'
+                                  : 'Regenerate answer'
+                              }
                             >
                               <RotateCcw
                                 size={14}

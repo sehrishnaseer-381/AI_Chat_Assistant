@@ -1442,3 +1442,61 @@ button:disabled {
 .search-error {
   margin: 0 4px;
 }
+
+.assistant-message-actions {
+  justify-content: flex-start;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.assistant-message-actions .message-action-button {
+  min-height: 32px;
+  padding: 6px 9px;
+  color: #68746b;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.assistant-message-actions .message-action-button:hover:not(:disabled) {
+  color: #245d43;
+  background: #f1f5f0;
+  border-color: #e4ebe3;
+}
+
+.assistant-message-actions .message-action-button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.assistant-message-actions .message-action-button:focus-visible {
+  outline: 2px solid #7a9b83;
+  outline-offset: 2px;
+}
+
+.assistant-message-actions .message-action-button:disabled {
+  color: #929a93;
+  background: transparent;
+}
+
+.assistant-message-actions .message-action-button.is-copied {
+  color: #245d43;
+  background: #edf4ed;
+  border-color: #dce9dc;
+}
+
+.assistant-message-actions .message-action-button.is-regenerating {
+  color: #245d43;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assistant-message-actions .message-action-button {
+    transition: none;
+  }
+}
