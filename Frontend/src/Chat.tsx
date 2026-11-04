@@ -2,6 +2,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -9,13 +10,18 @@ import {
 } from 'react'
 import {
   Bot,
-  Menu,
+  ArrowDown,
+  Camera,
+  Image as ImageIcon,
+  Moon,
   MessageSquare,
+  Search,
   Plus,
   Send,
   PanelLeftClose,
+  PanelLeftOpen,
+  SquarePen,
   Sparkles,
-  RefreshCw,
   LogOut,
   MoreHorizontal,
   Pencil,
@@ -24,6 +30,8 @@ import {
   Trash2,
   RotateCcw,
   Copy,
+  Sun,
+  Share2,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -40,12 +48,97 @@ import {
   retryChatMessageStream,
   type Conversation,
   type ChatMessage,
+  type ModelPreference,
 } from './api'
 import './Chat.css'
 
+type PendingAttachment = {
+  id: string
+  file: File
+  previewUrl: string
+}
+
+const MAX_IMAGE_COUNT = 3
+const MAX_IMAGE_SIZE_BYTES = 4 * 1024 * 1024
+const MAX_TOTAL_IMAGE_SIZE_BYTES = MAX_IMAGE_COUNT * MAX_IMAGE_SIZE_BYTES
+const SUPPORTED_IMAGE_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+])
+
+function isModelPreference(value: string): value is ModelPreference {
+  return value === 'auto' ||
+    value === 'openai/gpt-oss-20b' ||
+    value === 'openai/gpt-oss-120b'
+}
+
+function getApiErrorMessage(error: unknown, fallback: string): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'response' in error &&
+    typeof error.response === 'object' &&
+    error.response !== null &&
+    'data' in error.response &&
+    typeof error.response.data === 'object' &&
+    error.response.data !== null &&
+    'detail' in error.response.data &&
+    typeof error.response.data.detail === 'string'
+  ) {
+    return error.response.data.detail
+  }
+
+  return fallback
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Fall through to the legacy clipboard API for restricted browser contexts.
+    }
+  }
+
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.setAttribute('readonly', '')
+  textArea.style.position = 'fixed'
+  textArea.style.opacity = '0'
+  document.body.appendChild(textArea)
+  textArea.select()
+
+  try {
+    if (!document.execCommand('copy')) {
+      throw new Error('The browser rejected the copy command.')
+    }
+  } finally {
+    document.body.removeChild(textArea)
+  }
+}
+
 export default function Chat() {
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => window.innerWidth > 800,
+  )
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const savedTheme = localStorage.getItem('chat-theme')
+    return savedTheme === 'light' ? 'light' : 'dark'
+  })
   const [message, setMessage] = useState('')
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([])
+  const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false)
+  const [attachmentError, setAttachmentError] = useState('')
+  const [modelPreference, setModelPreference] = useState<ModelPreference>(() => {
+    const savedPreference = localStorage.getItem('model-preference')
+    return savedPreference && isModelPreference(savedPreference)
+      ? savedPreference
+      : 'auto'
+  })
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [activeConversationId, setActiveConversationId] =
@@ -53,18 +146,22 @@ export default function Chat() {
 
   const [loadingHistory, setLoadingHistory] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [sending, setSending] = useState(false)
   const [creatingChat, setCreatingChat] = useState(false)
   const [historyError, setHistoryError] = useState('')
   const [chatError, setChatError] = useState('')
 
   const [searchQuery, setSearchQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [searchResults, setSearchResults] = useState<Conversation[]>([])
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
 
   const [openConversationMenuId, setOpenConversationMenuId] =
   useState<number | null>(null)
+  const [chatActionsOpen, setChatActionsOpen] = useState(false)
+  const [headerFeedback, setHeaderFeedback] = useState('')
 
   const [renamingConversationId, setRenamingConversationId] =
     useState<number | null>(null)
@@ -76,6 +173,7 @@ export default function Chat() {
   const [failedMessage, setFailedMessage] = useState<{
   conversationId: number
   content: string
+  modelPreference: ModelPreference
   messageId?: number
 } | null>(null)
   const [editingMessageId, setEditingMessageId] = useState<number | null>(null)
@@ -96,14 +194,143 @@ export default function Chat() {
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const messagesAreaRef = useRef<HTMLElement>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement>(null)
   const shouldFollowStreamRef = useRef(true)
   const requestVersionRef = useRef(0)
   const searchRequestVersionRef = useRef(0)
   const copyFeedbackTimeoutRef = useRef<number | null>(null)
   const activeChatAbortRef = useRef<AbortController | null>(null)
+  const chatActionsRef = useRef<HTMLDivElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const headerFeedbackTimeoutRef = useRef<number | null>(null)
+  const initialConversationHandledRef = useRef(false)
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([])
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const cameraInputRef = useRef<HTMLInputElement>(null)
+  const attachmentMenuRef = useRef<HTMLDivElement>(null)
 
   const userId = Number(sessionStorage.getItem('user_id'))
   const userEmail = sessionStorage.getItem('user_email') || 'User'
+
+  useLayoutEffect(() => {
+    const textarea = composerInputRef.current
+    if (!textarea) return
+
+    textarea.style.height = '0px'
+    const maxHeight = 240
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`
+    textarea.style.overflowY =
+      textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
+  }, [message])
+
+  const clearPendingAttachments = useCallback(() => {
+    pendingAttachmentsRef.current.forEach((attachment) =>
+      URL.revokeObjectURL(attachment.previewUrl),
+    )
+    pendingAttachmentsRef.current = []
+    setPendingAttachments([])
+  }, [])
+
+  const handleAttachmentSelection = (files: FileList | null) => {
+    if (!files?.length) return
+
+    const selected = Array.from(files)
+    const current = pendingAttachmentsRef.current
+    let totalSize = current.reduce(
+      (total, attachment) => total + attachment.file.size,
+      0,
+    )
+    const next = [...current]
+    let error = ''
+
+    for (const file of selected) {
+      if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
+        error = 'Choose a PNG, JPG, JPEG, or WEBP image.'
+        continue
+      }
+      if (file.size > MAX_IMAGE_SIZE_BYTES) {
+        error = 'Each image must be 4 MB or smaller.'
+        continue
+      }
+      if (next.length >= MAX_IMAGE_COUNT) {
+        error = 'Attach no more than 3 images.'
+        break
+      }
+      if (totalSize + file.size > MAX_TOTAL_IMAGE_SIZE_BYTES) {
+        error = 'The combined image size cannot exceed 12 MB.'
+        continue
+      }
+
+      totalSize += file.size
+      next.push({
+        id: crypto.randomUUID(),
+        file,
+        previewUrl: URL.createObjectURL(file),
+      })
+    }
+
+    pendingAttachmentsRef.current = next
+    setPendingAttachments(next)
+    setAttachmentError(error)
+  }
+
+  const removePendingAttachment = (id: string) => {
+    const removed = pendingAttachmentsRef.current.find(
+      (attachment) => attachment.id === id,
+    )
+    if (removed) URL.revokeObjectURL(removed.previewUrl)
+    const next = pendingAttachmentsRef.current.filter(
+      (attachment) => attachment.id !== id,
+    )
+    pendingAttachmentsRef.current = next
+    setPendingAttachments(next)
+    setAttachmentError('')
+  }
+
+  useEffect(() => {
+    localStorage.setItem('chat-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    localStorage.setItem('model-preference', modelPreference)
+  }, [modelPreference])
+
+  useEffect(
+    () => () => {
+      pendingAttachmentsRef.current.forEach((attachment) =>
+        URL.revokeObjectURL(attachment.previewUrl),
+      )
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!attachmentMenuOpen) return
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !attachmentMenuRef.current?.contains(event.target)
+      ) {
+        setAttachmentMenuOpen(false)
+      }
+    }
+
+    document.addEventListener('pointerdown', closeOnOutsideClick)
+    return () =>
+      document.removeEventListener('pointerdown', closeOnOutsideClick)
+  }, [attachmentMenuOpen])
+
+  useEffect(() => {
+    const mobileLayout = window.matchMedia('(max-width: 800px)')
+    const syncSidebarToViewport = (event: MediaQueryListEvent) => {
+      setSidebarOpen(!event.matches)
+    }
+
+    mobileLayout.addEventListener('change', syncSidebarToViewport)
+    return () =>
+      mobileLayout.removeEventListener('change', syncSidebarToViewport)
+  }, [])
 
   const loadConversations = useCallback(async () => {
     if (!Number.isInteger(userId) || userId <= 0) {
@@ -155,10 +382,56 @@ export default function Chat() {
       if (copyFeedbackTimeoutRef.current !== null) {
         window.clearTimeout(copyFeedbackTimeoutRef.current)
       }
+      if (headerFeedbackTimeoutRef.current !== null) {
+        window.clearTimeout(headerFeedbackTimeoutRef.current)
+      }
       activeChatAbortRef.current?.abort()
     },
     [],
   )
+
+  useEffect(() => {
+    if (!chatActionsOpen) return
+
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (
+        event.target instanceof Node &&
+        !chatActionsRef.current?.contains(event.target)
+      ) {
+        setChatActionsOpen(false)
+      }
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setChatActionsOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeOnOutsideClick)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsideClick)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [chatActionsOpen])
+
+  const closeConversationSearch = useCallback(() => {
+    searchRequestVersionRef.current += 1
+    setSearchOpen(false)
+    setSearchQuery('')
+    setSearchResults([])
+    setSearching(false)
+    setSearchError('')
+  }, [])
+
+  useEffect(() => {
+    if (!searchOpen) return
+
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') closeConversationSearch()
+    }
+
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [closeConversationSearch, searchOpen])
 
   useEffect(() => {
     const query = searchQuery.trim()
@@ -206,19 +479,29 @@ export default function Chat() {
     }
   }, [searchQuery])
 
-  const selectConversation = async (conversationId: number) => {
+  const selectConversation = useCallback(async (conversationId: number) => {
     activeChatAbortRef.current?.abort()
+    clearPendingAttachments()
+    setAttachmentError('')
     setStreamedResponse('')
+    setShowScrollToBottom(false)
     shouldFollowStreamRef.current = true
     const requestVersion = ++requestVersionRef.current
 
     setActiveConversationId(conversationId)
     setMessages([])
     setMessage('')
+    setAttachmentError('')
     setChatError('')
     setFailedMessage(null)
     setOpenConversationMenuId(null)
+    setSearchOpen(false)
+    setSearchQuery('')
+    setSearchResults([])
     setLoadingMessages(true)
+    const url = new URL(window.location.href)
+    url.searchParams.set('conversation', String(conversationId))
+    window.history.replaceState({}, '', url)
 
     try {
       const data = await getConversationMessages(conversationId)
@@ -238,9 +521,36 @@ export default function Chat() {
         setLoadingMessages(false)
       }
     }
+  }, [clearPendingAttachments])
+
+  const toggleConversationSearch = () => {
+    if (searchOpen) {
+      closeConversationSearch()
+      return
+    }
+
+    setSearchOpen(true)
+    window.requestAnimationFrame(() => searchInputRef.current?.focus())
   }
 
+  useEffect(() => {
+    if (loadingHistory || initialConversationHandledRef.current) return
+
+    initialConversationHandledRef.current = true
+    const requestedId = Number(
+      new URLSearchParams(window.location.search).get('conversation'),
+    )
+    if (
+      Number.isInteger(requestedId) &&
+      conversations.some((conversation) => conversation.id === requestedId)
+    ) {
+      void selectConversation(requestedId)
+    }
+  }, [conversations, loadingHistory, selectConversation])
+
   const handleNewChat = async () => {
+    clearPendingAttachments()
+    setAttachmentError('')
     if (!Number.isInteger(userId) || userId <= 0) {
       setHistoryError('Your user session is missing. Please sign in again.')
       return
@@ -282,18 +592,50 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
   event?.preventDefault()
 
   const content = message.trim()
-  const conversationId = activeConversationId
+  let conversationId = activeConversationId
 
   if (
-    !content ||
-    !conversationId ||
+    (!content && pendingAttachmentsRef.current.length === 0) ||
+    creatingChat ||
     sending ||
     loadingMessages ||
     regeneratingMessageId !== null
   ) return
 
+  if (!conversationId) {
+    if (!Number.isInteger(userId) || userId <= 0) {
+      setHistoryError('Your user session is missing. Please sign in again.')
+      return
+    }
+
+    setCreatingChat(true)
+    setHistoryError('')
+    try {
+      const conversation = await createConversation(userId, 'New chat')
+      conversationId = conversation.id
+      setConversations((previous) => [
+        conversation,
+        ...previous.filter((item) => item.id !== conversation.id),
+      ])
+      requestVersionRef.current += 1
+      setActiveConversationId(conversation.id)
+      setMessages([])
+      setLoadingMessages(false)
+      setRenamingConversationId(null)
+      setRenameTitle('')
+    } catch {
+      setHistoryError(
+        'Could not create a new conversation. Please try again.',
+      )
+      return
+    } finally {
+      setCreatingChat(false)
+    }
+  }
+
   const requestVersion = requestVersionRef.current
   const controller = new AbortController()
+  const attachmentsToSend = [...pendingAttachmentsRef.current]
   let persistedUserMessageId: number | undefined
 
   shouldFollowStreamRef.current = true
@@ -301,7 +643,7 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
   setChatError('')
   setMessage('')
   setStreamedResponse('')
-  setFailedMessage({ conversationId, content })
+  setFailedMessage({ conversationId, content, modelPreference })
   activeChatAbortRef.current = controller
 
   try {
@@ -310,10 +652,9 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
       content,
       (userMessage) => {
         persistedUserMessageId = userMessage.id
-        if (
-          activeConversationId !== conversationId ||
-          requestVersionRef.current !== requestVersion
-        ) {
+        clearPendingAttachments()
+        setAttachmentError('')
+        if (requestVersionRef.current !== requestVersion) {
           return
         }
         setMessages((previous) => [
@@ -322,21 +663,22 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
         ])
       },
       (chunk) => {
-        if (
-          activeConversationId === conversationId &&
-          requestVersionRef.current === requestVersion
-        ) {
+        if (requestVersionRef.current === requestVersion) {
           setStreamedResponse((previous) => previous + chunk)
         }
       },
       controller.signal,
+      modelPreference,
+      () => {
+        if (requestVersionRef.current === requestVersion) {
+          setStreamedResponse('')
+        }
+      },
+      attachmentsToSend.map((attachment) => attachment.file),
     )
 
     // Ignore results if the conversation changed or was deleted.
-    if (
-      activeConversationId !== conversationId ||
-      requestVersionRef.current !== requestVersion
-    ) {
+    if (requestVersionRef.current !== requestVersion) {
       return
     }
 
@@ -351,12 +693,12 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
     ])
     setStreamedResponse('')
     setFailedMessage(null)
+    clearPendingAttachments()
 
     // Refresh conversation titles and ordering.
     void loadConversations()
   } catch (error) {
     if (
-      activeConversationId === conversationId &&
       requestVersionRef.current === requestVersion &&
       !controller.signal.aborted
     ) {
@@ -366,6 +708,7 @@ const handleSend = async (event?: FormEvent<HTMLFormElement>) => {
         setFailedMessage({
           conversationId,
           content,
+          modelPreference,
           messageId: persistedUserMessageId,
         })
       } else {
@@ -430,6 +773,15 @@ const handleRetryFailedMessage = async () => {
         }
       },
       controller.signal,
+      failed.modelPreference,
+      () => {
+        if (
+          activeConversationId === failed.conversationId &&
+          requestVersionRef.current === requestVersion
+        ) {
+          setStreamedResponse('')
+        }
+      },
     )
 
     if (
@@ -499,6 +851,20 @@ const handleRetryFailedMessage = async () => {
       return
     }
 
+    const originalMessage = messages.find(
+      (item) => item.id === editingMessageId,
+    )
+    if (!originalMessage) {
+      setEditingMessageError('This message is no longer available.')
+      return
+    }
+    if (nextValue === originalMessage.content.trim()) {
+      setEditingMessageId(null)
+      setEditedPrompt('')
+      setEditingMessageError('')
+      return
+    }
+
     setSavingEditedMessage(true)
     setEditingMessageError('')
 
@@ -507,6 +873,7 @@ const handleRetryFailedMessage = async () => {
         conversationId,
         editingMessageId,
         nextValue,
+        modelPreference,
       )
 
       if (
@@ -550,7 +917,10 @@ const handleRetryFailedMessage = async () => {
     } catch (error) {
       console.error('Failed to edit previous prompt:', error)
       setEditingMessageError(
-        'Could not update this message. Please check your input and try again.',
+        getApiErrorMessage(
+          error,
+          'Could not update this message. Please try again.',
+        ),
       )
     } finally {
       setSavingEditedMessage(false)
@@ -577,6 +947,7 @@ const handleRetryFailedMessage = async () => {
       const updatedMessage = await regenerateAssistantMessage(
         conversationId,
         assistantMessageId,
+        modelPreference,
       )
 
       if (
@@ -608,34 +979,8 @@ const handleRetryFailedMessage = async () => {
   }
 
   const handleCopyMessage = async (messageId: number, content: string) => {
-    const copyWithLegacyApi = () => {
-      const textArea = document.createElement('textarea')
-      textArea.value = content
-      textArea.setAttribute('readonly', '')
-      textArea.style.position = 'fixed'
-      textArea.style.opacity = '0'
-      document.body.appendChild(textArea)
-      textArea.select()
-
-      try {
-        if (!document.execCommand('copy')) {
-          throw new Error('The browser rejected the copy command.')
-        }
-      } finally {
-        document.body.removeChild(textArea)
-      }
-    }
-
     try {
-      if (navigator.clipboard?.writeText) {
-        try {
-          await navigator.clipboard.writeText(content)
-        } catch {
-          copyWithLegacyApi()
-        }
-      } else {
-        copyWithLegacyApi()
-      }
+      await copyTextToClipboard(content)
 
       setCopyErrorMessageId(null)
       setCopiedMessageId(messageId)
@@ -649,9 +994,94 @@ const handleRetryFailedMessage = async () => {
         copyFeedbackTimeoutRef.current = null
       }, 1800)
     } catch (error) {
-      console.error('Failed to copy assistant message:', error)
+      console.error('Failed to copy message:', error)
       setCopiedMessageId(null)
       setCopyErrorMessageId(messageId)
+    }
+  }
+
+  const handleSharePrompt = async (content: string) => {
+    try {
+      if (navigator.share) {
+        await navigator.share({ text: content })
+        return
+      }
+
+      await copyTextToClipboard(content)
+      showHeaderFeedback('Prompt copied to clipboard')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return
+      }
+      console.error('Failed to share prompt:', error)
+      showHeaderFeedback('Could not share prompt')
+    }
+  }
+
+  const showHeaderFeedback = (message: string) => {
+    setHeaderFeedback(message)
+    if (headerFeedbackTimeoutRef.current !== null) {
+      window.clearTimeout(headerFeedbackTimeoutRef.current)
+    }
+    headerFeedbackTimeoutRef.current = window.setTimeout(() => {
+      setHeaderFeedback('')
+      headerFeedbackTimeoutRef.current = null
+    }, 2200)
+  }
+
+  const handleShareConversation = async () => {
+    if (activeConversationId === null) return
+
+    const url = new URL(window.location.href)
+    url.searchParams.set('conversation', String(activeConversationId))
+    const title =
+      conversations.find((item) => item.id === activeConversationId)?.title ||
+      'AI Assistant conversation'
+
+    try {
+      if (navigator.share) {
+        try {
+          await navigator.share({
+            title,
+            text: 'Open this conversation in AI Assistant.',
+            url: url.toString(),
+          })
+          showHeaderFeedback('Shared successfully')
+          return
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            return
+          }
+        }
+      }
+
+      await copyTextToClipboard(url.toString())
+      showHeaderFeedback('Conversation link copied')
+    } catch (error) {
+      console.error('Failed to share conversation:', error)
+      showHeaderFeedback('Could not share conversation')
+    }
+  }
+
+  const handleCopyConversation = async () => {
+    const transcript = messages
+      .map((item) => `${item.role === 'user' ? 'You' : 'AI Assistant'}:\n${item.content}`)
+      .join('\n\n')
+
+    if (!transcript) {
+      showHeaderFeedback('There are no messages to copy')
+      setChatActionsOpen(false)
+      return
+    }
+
+    try {
+      await copyTextToClipboard(transcript)
+      showHeaderFeedback('Conversation copied')
+    } catch (error) {
+      console.error('Failed to copy conversation:', error)
+      showHeaderFeedback('Could not copy conversation')
+    } finally {
+      setChatActionsOpen(false)
     }
   }
 
@@ -695,9 +1125,9 @@ const handleRetryFailedMessage = async () => {
 
 
     const handleDeleteConversation = (conversationId: number) => {
-      const conversation = conversations.find(
-        (item) => item.id === conversationId,
-      )
+        const conversation =
+          conversations.find((item) => item.id === conversationId) ??
+          searchResults.find((item) => item.id === conversationId)
 
       if (!conversation) return
 
@@ -733,6 +1163,9 @@ const handleRetryFailedMessage = async () => {
 
         if (activeConversationId === conversationId) {
           requestVersionRef.current += 1
+          const url = new URL(window.location.href)
+          url.searchParams.delete('conversation')
+          window.history.replaceState({}, '', url)
           setMessages([])
           setMessage('')
           setChatError('')
@@ -764,10 +1197,22 @@ const handleRetryFailedMessage = async () => {
   }
 
   const searchActive = Boolean(searchQuery.trim())
-  const visibleConversations = searchActive ? searchResults : conversations
+  const searchItems = searchActive ? searchResults : conversations.slice(0, 6)
 
 return (
-  <div className={`chat-layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+  <div
+    className={`chat-layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}
+    data-theme={theme}
+  >
+    {sidebarOpen && (
+      <button
+        type="button"
+        className="sidebar-backdrop"
+        aria-label="Close navigation"
+        onClick={() => setSidebarOpen(false)}
+      />
+    )}
+
     <aside
       className={`chat-sidebar ${sidebarOpen ? '' : 'sidebar-hidden'}`}
     >
@@ -779,6 +1224,19 @@ return (
         <span className="brand-name">AI Assistant</span>
 
         <button
+          type="button"
+          className={`icon-button sidebar-search-toggle ${searchOpen ? 'active' : ''}`}
+          onClick={toggleConversationSearch}
+          aria-label={searchOpen ? 'Close conversation search' : 'Search conversations'}
+          aria-expanded={searchOpen}
+          aria-controls="conversation-search-dialog"
+          title={searchOpen ? 'Close search' : 'Search conversations'}
+        >
+          {searchOpen ? <X size={18} /> : <Search size={18} />}
+        </button>
+
+        <button
+          type="button"
           className="icon-button sidebar-toggle"
           onClick={() => setSidebarOpen(false)}
           aria-label="Close sidebar"
@@ -799,30 +1257,13 @@ return (
 
       <div className="history-section">
         <div className="history-label">YOUR CHATS</div>
-
-        <input
-          className="conversation-search"
-          type="search"
-          placeholder="Search conversations..."
-          aria-label="Search conversations"
-          value={searchQuery}
-          onChange={(event) => {
-            const query = event.target.value
-            searchRequestVersionRef.current += 1
-            setSearchQuery(query)
-            setSearchResults([])
-            setSearching(Boolean(query.trim()))
-            setSearchError('')
-          }}
-        />
-
-        {!searchActive && loadingHistory && (
+        {loadingHistory && (
           <div className="sidebar-message">
             Loading conversations...
           </div>
         )}
 
-        {!searchActive && historyError && (
+        {historyError && (
           <div className="sidebar-error">
             <p>{historyError}</p>
             <button onClick={() => void loadConversations()}>
@@ -831,8 +1272,7 @@ return (
           </div>
         )}
 
-        {!searchActive &&
-          !loadingHistory &&
+        {!loadingHistory &&
           !historyError &&
           conversations.length === 0 && (
             <div className="sidebar-message">
@@ -840,35 +1280,15 @@ return (
             </div>
           )}
 
-        {searchActive && searching && (
-          <div className="sidebar-message search-status" role="status">
-            Searching conversations...
-          </div>
-        )}
-
-        {searchActive && searchError && (
-          <div className="sidebar-error search-error" role="alert">
-            <p>{searchError}</p>
-          </div>
-        )}
-
-        {searchActive &&
-          !searching &&
-          !searchError &&
-          searchResults.length === 0 && (
-            <div className="sidebar-message" role="status">
-              No matching conversations found.
-            </div>
-          )}
-
-        {visibleConversations.map((conversation) => (
+        {conversations.map((conversation) => (
           <div
             key={conversation.id}
             className={`history-item-wrapper ${
               activeConversationId === conversation.id ? 'active' : ''
             }`}
           >
-            {renamingConversationId === conversation.id ? (
+            {renamingConversationId === conversation.id &&
+            activeConversationId !== conversation.id ? (
               <form
                 className="rename-form"
                 onSubmit={(event) => {
@@ -975,6 +1395,18 @@ return (
       </div>
 
       <div className="sidebar-footer">
+        <button
+          type="button"
+          className="icon-button theme-toggle"
+          onClick={() =>
+            setTheme((current) => current === 'dark' ? 'light' : 'dark')
+          }
+          aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+          title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+        >
+          {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+        </button>
+
         <div className="user-avatar">
           {userEmail.charAt(0).toUpperCase()}
         </div>
@@ -995,70 +1427,270 @@ return (
       </div>
     </aside>
 
-    <main className="chat-main">
-      {!sidebarOpen && (
-        <div className="topbar">
-          <button
-            className="icon-button"
-            onClick={() => setSidebarOpen(true)}
-            aria-label="Open sidebar"
-            title="Open sidebar"
-          >
-            <Menu size={20} />
-          </button>
-
-          <span className="topbar-title">AI Assistant</span>
-        </div>
-      )}
-
-      {!activeConversationId ? (
-        <div className="welcome-screen">
-          <div className="welcome-icon">
-            <Sparkles size={27} />
+    {searchOpen && (
+      <div
+        className="conversation-search-backdrop"
+        onClick={toggleConversationSearch}
+      >
+        <section
+          id="conversation-search-dialog"
+          className="conversation-search-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Search chats"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="conversation-search-header">
+            <input
+              ref={searchInputRef}
+              className="conversation-search-input"
+              type="search"
+              placeholder="Search..."
+              aria-label="Search chats"
+              value={searchQuery}
+              onChange={(event) => {
+                const query = event.target.value
+                searchRequestVersionRef.current += 1
+                setSearchQuery(query)
+                setSearchResults([])
+                setSearching(Boolean(query.trim()))
+                setSearchError('')
+              }}
+            />
+            <button
+              type="button"
+              className="conversation-search-close"
+              aria-label="Close search"
+              onClick={toggleConversationSearch}
+            >
+              <X size={20} />
+            </button>
           </div>
 
-          <h1>How can I help you today?</h1>
-          <p>Ask a question, explore an idea, or work through a problem.</p>
+          <div className="conversation-search-results">
+            <div className="conversation-search-label">
+              {searchActive ? 'Search results' : 'Recent chats'}
+            </div>
 
-          <button
-            className="welcome-new-chat"
-            onClick={() => void handleNewChat()}
-            disabled={creatingChat}
-          >
-            <Plus size={18} />
-            {creatingChat
-              ? 'Creating conversation...'
-              : 'Start a new conversation'}
-          </button>
+            {searchActive && searching && (
+              <p className="conversation-search-message" role="status">
+                Searching...
+              </p>
+            )}
+            {searchActive && searchError && (
+              <p className="conversation-search-message is-error" role="alert">
+                {searchError}
+              </p>
+            )}
+            {searchActive &&
+              !searching &&
+              !searchError &&
+              searchItems.length === 0 && (
+                <p className="conversation-search-message" role="status">
+                  No matching conversations found.
+                </p>
+              )}
+            {!searchActive && loadingHistory && (
+              <p className="conversation-search-message" role="status">
+                Loading conversations...
+              </p>
+            )}
+            {!searchActive && historyError && (
+              <p className="conversation-search-message is-error" role="alert">
+                {historyError}{' '}
+                <button
+                  type="button"
+                  className="conversation-search-retry"
+                  onClick={() => void loadConversations()}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+            {!searchActive &&
+              !historyError &&
+              !loadingHistory &&
+              conversations.length === 0 && (
+                <p className="conversation-search-message">
+                  Your conversations will appear here.
+                </p>
+              )}
+
+            {(searchActive
+              ? !searching && !searchError
+              : !historyError) &&
+              searchItems.map((conversation) => (
+                <button
+                  type="button"
+                  key={conversation.id}
+                  className="conversation-search-result"
+                  onClick={() => void selectConversation(conversation.id)}
+                >
+                  <MessageSquare size={20} aria-hidden="true" />
+                  <span>{conversation.title || 'New chat'}</span>
+                </button>
+              ))}
+          </div>
+        </section>
+      </div>
+    )}
+
+    <main className="chat-main">
+      <header className="topbar chat-topbar">
+        <div className="topbar-leading">
+          {!sidebarOpen && (
+            <>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setSidebarOpen(true)}
+                aria-label="Open sidebar"
+                title="Open sidebar"
+              >
+                <PanelLeftOpen size={20} />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => void handleNewChat()}
+                aria-label="New chat"
+                title="New chat"
+                disabled={creatingChat}
+              >
+                <SquarePen size={19} />
+              </button>
+            </>
+          )}
+        </div>
+
+        {activeConversationId !== null && (
+          <div className="chat-header-actions">
+            {renamingConversationId === activeConversationId ? (
+              <form
+                className="header-rename-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  void handleRenameConversation(activeConversationId)
+                }}
+              >
+                <input
+                  autoFocus
+                  value={renameTitle}
+                  onChange={(event) => setRenameTitle(event.target.value)}
+                  maxLength={200}
+                  aria-label="Conversation title"
+                  disabled={isRenaming}
+                />
+                <button
+                  type="submit"
+                  className="icon-button"
+                  aria-label="Save conversation name"
+                  disabled={isRenaming || !renameTitle.trim()}
+                >
+                  <Check size={17} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label="Cancel renaming"
+                  onClick={() => {
+                    setRenamingConversationId(null)
+                    setRenameTitle('')
+                  }}
+                  disabled={isRenaming}
+                >
+                  <X size={17} />
+                </button>
+              </form>
+            ) : (
+              <>
+                <div className="chat-actions-wrap" ref={chatActionsRef}>
+                  <button
+                    type="button"
+                    className="icon-button chat-actions-button"
+                    onClick={() => setChatActionsOpen((open) => !open)}
+                    aria-label="Conversation options"
+                    aria-haspopup="menu"
+                    aria-expanded={chatActionsOpen}
+                    title="Conversation options"
+                  >
+                    <MoreHorizontal size={21} />
+                  </button>
+
+                  {chatActionsOpen && (
+                    <div className="conversation-menu chat-actions-menu" role="menu">
+                      <button
+                        type="button"
+                        className="conversation-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          const conversation = conversations.find(
+                            (item) => item.id === activeConversationId,
+                          )
+                          setRenameTitle(conversation?.title || '')
+                          setRenamingConversationId(activeConversationId)
+                          setChatActionsOpen(false)
+                        }}
+                      >
+                        <Pencil size={15} />
+                        <span>Rename</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="conversation-menu-item"
+                        role="menuitem"
+                        onClick={() => void handleCopyConversation()}
+                      >
+                        <Copy size={15} />
+                        <span>Copy conversation</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="conversation-menu-item delete-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          setChatActionsOpen(false)
+                          handleDeleteConversation(activeConversationId)
+                        }}
+                      >
+                        <Trash2 size={15} />
+                        <span>Delete</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  className="icon-button header-share-button"
+                  onClick={() => void handleShareConversation()}
+                  aria-label="Share conversation"
+                  title="Share conversation"
+                >
+                  <Share2 size={17} />
+                  <span>Share</span>
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {headerFeedback && (
+          <span className="header-feedback" role="status">
+            {headerFeedback}
+          </span>
+        )}
+      </header>
+
+      <div
+        className={`chat-content ${activeConversationId === null ? 'new-chat-state' : ''}`}
+      >
+      {activeConversationId === null ? (
+        <div className="welcome-screen">
+          <h1>What&apos;s on your mind today?</h1>
         </div>
       ) : (
         <>
-          <header className="conversation-header">
-            <div>
-              <h2>
-                {conversations.find(
-                  (item) => item.id === activeConversationId,
-                )?.title || 'Your conversation'}
-              </h2>
-              <span>AI Assistant</span>
-            </div>
-
-            <button
-              className="icon-button"
-              onClick={() => void selectConversation(activeConversationId)}
-              disabled={
-              loadingMessages ||
-              sending ||
-              savingEditedMessage ||
-              regeneratingMessageId !== null
-              }
-              title="Reload messages"
-              aria-label="Reload messages"
-            >
-              <RefreshCw size={17} />
-            </button>
-          </header>
-
           <section
             ref={messagesAreaRef}
             className={`messages-area ${sending ? 'streaming-active' : ''}`}
@@ -1068,6 +1700,9 @@ return (
               const distanceFromBottom =
                 element.scrollHeight - element.scrollTop - element.clientHeight
               shouldFollowStreamRef.current = distanceFromBottom < 64
+              setShowScrollToBottom((visible) =>
+                distanceFromBottom > 180 ? true : visible && distanceFromBottom > 64,
+              )
             }}
           >
             {loadingMessages && (
@@ -1140,6 +1775,24 @@ return (
                   ) : (
                     <>
                       <div className="message-content">
+                        {item.role === 'user' &&
+                          Boolean(item.attachments?.length) && (
+                            <div className="message-image-attachments">
+                              {item.attachments?.map((attachment) => (
+                                <figure
+                                  className="message-image-attachment"
+                                  key={`${item.id}-${attachment.filename}`}
+                                >
+                                  <img
+                                    src={attachment.data_url}
+                                    alt={attachment.filename}
+                                    loading="lazy"
+                                  />
+                                  <figcaption>{attachment.filename}</figcaption>
+                                </figure>
+                              ))}
+                            </div>
+                          )}
                         {item.role === 'assistant' ? (
                           <ReactMarkdown remarkPlugins={[remarkGfm]}>
                             {item.content}
@@ -1150,27 +1803,69 @@ return (
                       </div>
 
                       {item.role === 'user' && (
-                        <div className="message-actions">
-                          <button
-                            type="button"
-                            className="message-action-button"
-                            disabled={
-                              sending ||
-                              loadingMessages ||
-                              savingEditedMessage ||
-                              regeneratingMessageId !== null
-                            }
-                            onClick={() => {
-                              setEditingMessageId(item.id)
-                              setEditedPrompt(item.content)
-                              setEditingMessageError('')
-                            }}
-                            aria-label="Edit message"
-                          >
-                            <Pencil size={14} />
-                            Edit
-                          </button>
-                        </div>
+                        <>
+                          {copyErrorMessageId === item.id && (
+                            <p className="copy-message-error" role="alert">
+                              Could not copy this prompt. Try selecting and
+                              copying the text.
+                            </p>
+                          )}
+                          <div className="message-actions user-message-actions">
+                            <button
+                              type="button"
+                              className={`message-action-button${copiedMessageId === item.id ? ' is-copied' : ''}`}
+                              onClick={() =>
+                                void handleCopyMessage(item.id, item.content)
+                              }
+                              aria-label={
+                                copiedMessageId === item.id
+                                  ? 'Prompt copied'
+                                  : 'Copy prompt'
+                              }
+                              data-tooltip={
+                                copiedMessageId === item.id
+                                  ? 'Copied'
+                                  : 'Copy'
+                              }
+                            >
+                              {copiedMessageId === item.id ? (
+                                <Check size={18} />
+                              ) : (
+                                <Copy size={18} />
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              className="message-action-button"
+                              onClick={() =>
+                                void handleSharePrompt(item.content)
+                              }
+                              aria-label="Share prompt"
+                              data-tooltip="Share"
+                            >
+                              <Share2 size={18} />
+                            </button>
+                            <button
+                              type="button"
+                              className="message-action-button"
+                              disabled={
+                                sending ||
+                                loadingMessages ||
+                                savingEditedMessage ||
+                                regeneratingMessageId !== null
+                              }
+                              onClick={() => {
+                                setEditingMessageId(item.id)
+                                setEditedPrompt(item.content)
+                                setEditingMessageError('')
+                              }}
+                              aria-label="Edit prompt"
+                              data-tooltip="Edit"
+                            >
+                              <Pencil size={18} />
+                            </button>
+                          </div>
+                        </>
                       )}
 
                       {item.role === 'assistant' && (
@@ -1313,39 +2008,183 @@ return (
             <div ref={bottomRef} />
           </section>
 
-          <div className="composer-container">
-            <form className="message-composer" onSubmit={handleSend}>
-              <textarea
-                value={message}
-                onChange={(event) => setMessage(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
-                placeholder="Message AI Assistant..."
-                rows={1}
-                aria-label="Message"
-              />
-
-              <button
-                type="submit"
-                className="send-button"
-                disabled={
-                  !message.trim() ||
-                  sending ||
-                  loadingMessages ||
-                  regeneratingMessageId !== null
+          {showScrollToBottom && (
+            <button
+              type="button"
+              className="scroll-to-bottom"
+              aria-label="Scroll to latest message"
+              title="Scroll to latest message"
+              onClick={() => {
+                const messagesArea = messagesAreaRef.current
+                if (messagesArea) {
+                  messagesArea.scrollTo({
+                    top: messagesArea.scrollHeight,
+                    behavior: 'smooth',
+                  })
                 }
-                aria-label="Send message"
-                title="Send message"
-              >
-                <Send size={17} />
-              </button>
-            </form>
+              }}
+            >
+              <ArrowDown size={18} />
+            </button>
+          )}
 
-            <p className="composer-hint">
-              Enter to send ┬╖ Shift + Enter for a new line
-            </p>
-          </div>
         </>
       )}
+
+      <div className="composer-container">
+        {pendingAttachments.length > 0 && (
+          <div className="composer-attachments" aria-label="Attached images">
+            {pendingAttachments.map((attachment) => (
+              <div className="composer-attachment" key={attachment.id}>
+                <img
+                  src={attachment.previewUrl}
+                  alt={attachment.file.name}
+                />
+                <span title={attachment.file.name}>
+                  {attachment.file.name}
+                </span>
+                <button
+                  type="button"
+                  className="composer-attachment-remove"
+                  onClick={() => removePendingAttachment(attachment.id)}
+                  aria-label={`Remove ${attachment.file.name}`}
+                  disabled={sending}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {attachmentError && (
+          <p className="attachment-error" role="alert">
+            {attachmentError}
+          </p>
+        )}
+
+        <form className="message-composer" onSubmit={handleSend}>
+          <div className="composer-attachment-menu-wrap" ref={attachmentMenuRef}>
+            <button
+              type="button"
+              className="composer-attach-button"
+              onClick={() => setAttachmentMenuOpen((open) => !open)}
+              aria-label="Add attachments"
+              aria-haspopup="menu"
+              aria-expanded={attachmentMenuOpen}
+              title="Add photos and files"
+              disabled={
+                sending ||
+                creatingChat ||
+                pendingAttachments.length >= MAX_IMAGE_COUNT
+              }
+            >
+              <Plus size={21} />
+            </button>
+
+            {attachmentMenuOpen && (
+              <div className="composer-attachment-menu" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setAttachmentMenuOpen(false)
+                    imageInputRef.current?.click()
+                  }}
+                >
+                  <ImageIcon size={17} />
+                  <span>Add photos &amp; files</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setAttachmentMenuOpen(false)
+                    cameraInputRef.current?.click()
+                  }}
+                >
+                  <Camera size={17} />
+                  <span>Take photo</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          <textarea
+            ref={composerInputRef}
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={handleComposerKeyDown}
+            placeholder="Message AI Assistant..."
+            rows={1}
+            aria-label="Message"
+          />
+
+          <div className="composer-controls">
+            <label className="model-picker">
+              <span className="visually-hidden">Model</span>
+              <select
+                value={modelPreference}
+                onChange={(event) => {
+                  const preference = event.currentTarget.value
+                  if (isModelPreference(preference)) {
+                    setModelPreference(preference)
+                  }
+                }}
+                aria-label="Choose model"
+                disabled={sending}
+              >
+                <option value="auto">Auto</option>
+                <option value="openai/gpt-oss-20b">GPT-OSS 20B</option>
+                <option value="openai/gpt-oss-120b">GPT-OSS 120B</option>
+              </select>
+            </label>
+
+            <button
+              type="submit"
+              className="send-button"
+              disabled={
+                (!message.trim() && pendingAttachments.length === 0) ||
+                creatingChat ||
+                sending ||
+                loadingMessages ||
+                regeneratingMessageId !== null
+              }
+              aria-label="Send message"
+              title="Send message"
+            >
+              <Send size={17} />
+            </button>
+          </div>
+        </form>
+
+        <input
+          ref={imageInputRef}
+          className="visually-hidden"
+          type="file"
+          accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
+          multiple
+          onChange={(event) => {
+            handleAttachmentSelection(event.currentTarget.files)
+            event.currentTarget.value = ''
+          }}
+          aria-label="Choose image files"
+        />
+        <input
+          ref={cameraInputRef}
+          className="visually-hidden"
+          type="file"
+          accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
+          capture="environment"
+          onChange={(event) => {
+            handleAttachmentSelection(event.currentTarget.files)
+            event.currentTarget.value = ''
+          }}
+          aria-label="Take a photo"
+        />
+
+      </div>
+      </div>
     </main>
 
     {deleteTarget && (

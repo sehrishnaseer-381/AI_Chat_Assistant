@@ -51,6 +51,11 @@ export interface ChatMessage {
   conversation_id: number
   role: 'user' | 'assistant'
   content: string
+  attachments?: {
+    filename: string
+    content_type: string
+    data_url: string
+  }[]
   created_at: string
 }
 
@@ -58,6 +63,11 @@ export interface ChatResponse {
   user_message: ChatMessage
   assistant_message: ChatMessage
 }
+
+export type ModelPreference =
+  | 'auto'
+  | 'openai/gpt-oss-20b'
+  | 'openai/gpt-oss-120b'
 
 export async function login(email: string, password: string) {
   const response = await api.post<TokenResponse>('/auth/login', {
@@ -148,10 +158,11 @@ export async function editMessage(
   conversationId: number,
   messageId: number,
   content: string,
+  modelPreference: ModelPreference = 'auto',
 ) {
   const response = await api.put<ChatResponse>(
     `/conversations/${conversationId}/messages/${messageId}`,
-    { content },
+    { content, model_preference: modelPreference },
   )
 
   return response.data
@@ -160,9 +171,11 @@ export async function editMessage(
 export async function regenerateAssistantMessage(
   conversationId: number,
   messageId: number,
+  modelPreference: ModelPreference = 'auto',
 ) {
   const response = await api.post<ChatMessage>(
     `/conversations/${conversationId}/messages/${messageId}/regenerate`,
+    { model_preference: modelPreference },
   )
 
   return response.data
@@ -171,10 +184,11 @@ export async function regenerateAssistantMessage(
 export async function sendChatMessage(
   conversationId: number,
   content: string,
+  modelPreference: ModelPreference = 'auto',
 ) {
   const response = await api.post<ChatResponse>(
     `/conversations/${conversationId}/chat`,
-    { content },
+    { content, model_preference: modelPreference },
   )
 
   return response.data
@@ -182,15 +196,18 @@ export async function sendChatMessage(
 
 async function consumeChatStream(
   path: string,
-  body: object | undefined,
+  body: object | FormData | undefined,
   onUserMessage: (message: ChatMessage) => void,
   onToken: (content: string) => void,
   signal: AbortSignal,
+  onReset: () => void,
 ) {
   const token = sessionStorage.getItem('access_token')
   const headers: Record<string, string> = {
     Accept: 'text/event-stream',
-    'Content-Type': 'application/json',
+  }
+  if (body !== undefined && !(body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json'
   }
   if (token) headers.Authorization = `Bearer ${token}`
 
@@ -199,7 +216,10 @@ async function consumeChatStream(
     {
       method: 'POST',
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body:
+        body === undefined || body instanceof FormData
+          ? body
+          : JSON.stringify(body),
       signal,
     },
   )
@@ -255,6 +275,8 @@ async function consumeChatStream(
       onUserMessage(parsed.user_message)
     } else if (parsed.type === 'token' && typeof parsed.content === 'string') {
       onToken(parsed.content)
+    } else if (parsed.type === 'reset') {
+      onReset()
     } else if (parsed.type === 'complete' && parsed.assistant_message) {
       receivedMessages.assistant = parsed.assistant_message
     } else if (parsed.type === 'error') {
@@ -309,13 +331,29 @@ export async function streamChatMessage(
   onUserMessage: (message: ChatMessage) => void,
   onToken: (content: string) => void,
   signal: AbortSignal,
+  modelPreference: ModelPreference = 'auto',
+  onReset: () => void = () => undefined,
+  attachments: File[] = [],
 ) {
+  let body: object | FormData = {
+    content,
+    model_preference: modelPreference,
+  }
+  if (attachments.length > 0) {
+    const formData = new FormData()
+    formData.append('content', content)
+    formData.append('model_preference', modelPreference)
+    attachments.forEach((file) => formData.append('images', file, file.name))
+    body = formData
+  }
+
   return consumeChatStream(
     `/conversations/${conversationId}/chat/stream`,
-    { content },
+    body,
     onUserMessage,
     onToken,
     signal,
+    onReset,
   )
 }
 
@@ -325,13 +363,16 @@ export async function retryChatMessageStream(
   onUserMessage: (message: ChatMessage) => void,
   onToken: (content: string) => void,
   signal: AbortSignal,
+  modelPreference: ModelPreference = 'auto',
+  onReset: () => void = () => undefined,
 ) {
   return consumeChatStream(
     `/conversations/${conversationId}/messages/${messageId}/retry/stream`,
-    undefined,
+    { model_preference: modelPreference },
     onUserMessage,
     onToken,
     signal,
+    onReset,
   )
 }
 

@@ -2,6 +2,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,8 +17,22 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     frontend_origin: str = "http://localhost:5173"
 
-    groq_model: str = "llama-3.3-70b-versatile"
     groq_api_key: str | None = None
+    groq_vision_model: str = Field(
+        default="qwen/qwen3.8-27b",
+        min_length=1,
+    )
+    groq_max_completion_tokens: int = Field(
+        default=4096,
+        ge=1,
+        le=65536,
+    )
+    groq_default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    groq_temperature_override: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+    )
     database_url: str
 
     jwt_secret_key: str

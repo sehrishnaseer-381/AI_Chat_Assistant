@@ -7,23 +7,63 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.datastructures import UploadFile
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import Conversation, Message, User
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatRequest, ChatResponse, ModelSelectionRequest
 from app.schemas.message import MessageRead
+from app.schemas.model import ModelPreference
 from app.services.ai_service import (
     generate_reply,
     stream_reply,
     synchronize_graph_history,
 )
+from app.services.vision_service import (
+    MAX_TOTAL_IMAGE_SIZE_BYTES,
+    validate_image_uploads,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Chat"])
+
+MAX_CHAT_REQUEST_BYTES = MAX_TOTAL_IMAGE_SIZE_BYTES + 128 * 1024
+CHAT_REQUEST_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": ChatRequest.model_json_schema(),
+            },
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "maxLength": 12000},
+                        "model_preference": {
+                            "type": "string",
+                            "enum": [
+                                "auto",
+                                "openai/gpt-oss-20b",
+                                "openai/gpt-oss-120b",
+                            ],
+                        },
+                        "images": {
+                            "type": "array",
+                            "maxItems": 3,
+                            "items": {"type": "string", "format": "binary"},
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 def generate_conversation_title(message: str) -> str:
@@ -44,6 +84,89 @@ def generate_conversation_title(message: str) -> str:
     return title or "New chat"
 
 
+async def parse_chat_request(request: Request) -> tuple[
+    ChatRequest,
+    list[dict[str, str]],
+]:
+    content_type = request.headers.get("content-type", "").lower()
+    attachments: list[dict[str, str]] = []
+
+    try:
+        if content_type.startswith("application/json"):
+            body = await request.json()
+            payload = ChatRequest.model_validate(body)
+        elif content_type.startswith("multipart/form-data"):
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > MAX_CHAT_REQUEST_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The chat request exceeds the supported size.",
+                )
+
+            async with request.form(
+                max_files=3,
+                max_fields=2,
+                max_part_size=64 * 1024,
+            ) as form:
+                raw_content = form.get("content", "")
+                raw_preference = form.get("model_preference", "auto")
+                uploads = form.getlist("images")
+                if not isinstance(raw_content, str) or not isinstance(
+                    raw_preference, str
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The chat request fields are invalid.",
+                    )
+                if not all(isinstance(item, UploadFile) for item in uploads):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Image attachments must be uploaded as files.",
+                    )
+                attachments = await validate_image_uploads(uploads)
+
+            if not raw_content.strip() and attachments:
+                raw_content = "Please describe the attached image(s)."
+            payload = ChatRequest.model_validate(
+                {
+                    "content": raw_content,
+                    "model_preference": raw_preference,
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=415,
+                detail="Send chat requests as JSON or multipart form data.",
+            )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_input=False),
+        ) from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="The chat request could not be parsed.",
+        ) from exc
+
+    if not isinstance(payload, ChatRequest):
+        raise HTTPException(
+            status_code=422,
+            detail="The chat request must be a JSON object.",
+        )
+    return payload, attachments
+
+
+def graph_history_message(message: Message) -> dict[str, object]:
+    history_message: dict[str, object] = {
+        "role": message.role,
+        "content": message.content,
+    }
+    if message.attachments:
+        history_message["attachments"] = message.attachments
+    return history_message
+
+
 def sse_event(event_type: str, payload: dict) -> str:
     data = json.dumps(
         {"type": event_type, **jsonable_encoder(payload)},
@@ -52,18 +175,69 @@ def sse_event(event_type: str, payload: dict) -> str:
     return f"data: {data}\n\n"
 
 
+def _parse_stream_chunk(
+    chunk: object,
+) -> tuple[str, dict[str, object], str | None]:
+    if isinstance(chunk, str):
+        return "token", {"content": chunk}, chunk
+
+    if not isinstance(chunk, dict):
+        raise TypeError("The AI stream returned an unsupported chunk.")
+
+    event_type = chunk.get("type")
+    if event_type == "token":
+        content = chunk.get("content")
+        if not isinstance(content, str):
+            raise TypeError("The AI stream returned a malformed token event.")
+        return "token", {"content": content}, content
+
+    if event_type == "tool_start":
+        tool = chunk.get("tool")
+        tool_call_id = chunk.get("tool_call_id")
+        if not isinstance(tool, str) or (
+            tool_call_id is not None and not isinstance(tool_call_id, str)
+        ):
+            raise TypeError("The AI stream returned a malformed tool event.")
+        return "tool_start", {
+            "tool": tool,
+            "tool_call_id": tool_call_id,
+        }, None
+
+    if event_type == "tool_result":
+        tool = chunk.get("tool")
+        tool_call_id = chunk.get("tool_call_id")
+        content = chunk.get("content")
+        status = chunk.get("status")
+        if (
+            not isinstance(tool, str)
+            or (tool_call_id is not None and not isinstance(tool_call_id, str))
+            or not isinstance(content, (str, list, dict))
+            or not isinstance(status, str)
+        ):
+            raise TypeError("The AI stream returned a malformed tool result.")
+        return "tool_result", {
+            "tool": tool,
+            "tool_call_id": tool_call_id,
+            "content": content,
+            "status": status,
+        }, None
+
+    if event_type == "reset":
+        return "reset", {}, None
+
+    raise ValueError("The AI stream returned an unknown event.")
+
+
 def stream_response_for_message(
     request: Request,
     db: Session,
     conversation_id: int,
     user_message: Message,
     history: list[Message],
+    model_preference: ModelPreference = "auto",
 ) -> StreamingResponse:
     graph = request.app.state.graph
-    persisted_history = [
-        {"role": item.role, "content": item.content}
-        for item in history
-    ]
+    persisted_history = [graph_history_message(item) for item in history]
     user_message_data = MessageRead.model_validate(
         user_message
     ).model_dump(mode="json")
@@ -78,10 +252,7 @@ def stream_response_for_message(
             ).all()
         )
         await synchronize_graph_history(
-            [
-                {"role": item.role, "content": item.content}
-                for item in current_history
-            ],
+            [graph_history_message(item) for item in current_history],
             graph,
             conversation_id,
         )
@@ -93,22 +264,26 @@ def stream_response_for_message(
                 {"user_message": user_message_data},
             )
 
-            response_parts = []
-            messages = [
-                {"role": item.role, "content": item.content}
-                for item in history
-            ]
+            response_parts: list[str] = []
+            messages = [graph_history_message(item) for item in history]
 
             async for chunk in stream_reply(
                 messages=messages,
                 graph=graph,
                 conversation_id=conversation_id,
+                model_preference=model_preference,
             ):
                 if await request.is_disconnected():
                     raise asyncio.CancelledError()
 
-                response_parts.append(chunk)
-                yield sse_event("token", {"content": chunk})
+                event_type, payload, text = _parse_stream_chunk(chunk)
+                if event_type == "token" and not text:
+                    continue
+                if event_type == "reset":
+                    response_parts.clear()
+                if text is not None:
+                    response_parts.append(text)
+                yield sse_event(event_type, payload)
 
             reply = "".join(response_parts)
             if not reply.strip():
@@ -180,10 +355,10 @@ def stream_response_for_message(
 @router.post(
     "/conversations/{conversation_id}/chat",
     response_model=ChatResponse,
+    openapi_extra=CHAT_REQUEST_OPENAPI,
 )
 async def chat_with_ai(
     conversation_id: int,
-    payload: ChatRequest,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -201,6 +376,8 @@ async def chat_with_ai(
             status_code=404,
             detail="Conversation not found.",
         )
+
+    payload, attachments = await parse_chat_request(request)
 
     # Generate a title only for a new conversation.
     if conversation.title == "New chat":
@@ -225,6 +402,7 @@ async def chat_with_ai(
         conversation_id=conversation_id,
         role="user",
         content=payload.content,
+        attachments=attachments,
     )
     db.add(user_message)
     db.commit()
@@ -249,7 +427,7 @@ async def chat_with_ai(
     ]
 
     messages.extend(
-        {"role": message.role, "content": message.content}
+        graph_history_message(message)
         for message in history
     )
 
@@ -259,6 +437,7 @@ async def chat_with_ai(
             messages=messages,
             graph=request.app.state.graph,
             conversation_id=conversation_id,
+            model_preference=payload.model_preference,
         )
     except Exception as exc:
         logger.exception("AI response generation failed")
@@ -289,10 +468,10 @@ async def chat_with_ai(
 @router.post(
     "/conversations/{conversation_id}/chat/stream",
     response_class=StreamingResponse,
+    openapi_extra=CHAT_REQUEST_OPENAPI,
 )
 async def chat_with_ai_stream(
     conversation_id: int,
-    payload: ChatRequest,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -308,6 +487,8 @@ async def chat_with_ai_stream(
             status_code=404,
             detail="Conversation not found.",
         )
+
+    payload, attachments = await parse_chat_request(request)
 
     if conversation.title == "New chat":
         existing_user_message = db.scalar(
@@ -327,6 +508,7 @@ async def chat_with_ai_stream(
         conversation_id=conversation_id,
         role="user",
         content=payload.content,
+        attachments=attachments,
     )
     db.add(user_message)
     db.commit()
@@ -346,6 +528,7 @@ async def chat_with_ai_stream(
         conversation_id,
         user_message,
         history,
+        payload.model_preference,
     )
 
 
@@ -357,6 +540,7 @@ async def retry_chat_with_ai_stream(
     conversation_id: int,
     message_id: int,
     request: Request,
+    payload: ModelSelectionRequest | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -395,4 +579,5 @@ async def retry_chat_with_ai_stream(
         conversation_id,
         history[-1],
         history,
+        (payload or ModelSelectionRequest()).model_preference,
     )

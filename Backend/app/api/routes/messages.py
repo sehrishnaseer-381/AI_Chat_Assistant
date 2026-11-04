@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models import Conversation, Message, User
-from app.schemas.chat import ChatResponse
+from app.schemas.chat import ChatResponse, ModelSelectionRequest
 from app.schemas.message import MessageCreate, MessageRead, MessageUpdate
 from app.services.ai_service import generate_reply, synchronize_graph_history
 
@@ -64,15 +64,21 @@ def get_owned_message(
     return message
 
 
-def message_history(messages: list[Message]) -> list[dict[str, str]]:
-    return [
-        {"role": message.role, "content": message.content}
-        for message in messages
-    ]
+def message_history(messages: list[Message]) -> list[dict[str, object]]:
+    history: list[dict[str, object]] = []
+    for message in messages:
+        item: dict[str, object] = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.attachments:
+            item["attachments"] = message.attachments
+        history.append(item)
+    return history
 
 
 async def restore_graph_history(
-    history: list[dict[str, str]],
+    history: list[dict[str, object]],
     graph,
     conversation_id: int,
 ) -> None:
@@ -165,34 +171,45 @@ async def edit_message(
             detail="The message content is unchanged.",
         )
 
-    message.content = new_content
-    db.flush()
-
-    history = list(
+    original_messages = list(
         db.scalars(
             select(Message)
-            .where(
-                Message.conversation_id == conversation_id,
-                Message.id <= message.id,
-            )
+            .where(Message.conversation_id == conversation_id)
             .order_by(Message.id.asc())
         ).all()
     )
-
-    response_messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
-    response_messages.extend(
-        {"role": item.role, "content": item.content}
-        for item in history
+    original_history = message_history(original_messages)
+    prompt_history = message_history(
+        [item for item in original_messages if item.id <= message.id]
     )
+
+    message.content = new_content
+    db.flush()
+
+    response_messages: list[dict[str, object]] = [
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        *prompt_history[:-1],
+        {**prompt_history[-1], "content": new_content},
+    ]
 
     try:
         reply = await generate_reply(
             messages=response_messages,
             graph=request.app.state.graph,
             conversation_id=conversation_id,
+            model_preference=payload.model_preference,
         )
     except Exception as exc:
         db.rollback()
+        await restore_graph_history(
+            original_history,
+            request.app.state.graph,
+            conversation_id,
+        )
+        logger.exception(
+            "Edited assistant response generation failed for conversation %s",
+            conversation_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Could not regenerate a response for the edited message.",
@@ -231,6 +248,7 @@ async def regenerate_assistant_message(
     conversation_id: int,
     message_id: int,
     request: Request,
+    payload: ModelSelectionRequest | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -301,6 +319,9 @@ async def regenerate_assistant_message(
             messages=prompt_history,
             graph=graph,
             conversation_id=conversation_id,
+            model_preference=(
+                payload or ModelSelectionRequest()
+            ).model_preference,
         )
     except Exception as exc:
         db.rollback()
